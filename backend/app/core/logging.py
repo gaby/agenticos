@@ -151,10 +151,12 @@ class PiiRedactionFilter(logging.Filter):
     forget it, and the alternative - sanitising at each of the dozen places a
     request value reaches a log - is the copy that ends up weaker.
 
-    Values passed through `extra=` are escaped too. The default formatter does
-    not render them, so they cannot forge a line today; a deployment that plugs
-    in one that does - a JSON or key-value formatter, which is the ordinary
-    production choice - must not acquire the hole by changing its formatter.
+    Values passed through `extra=` are redacted and escaped too, whatever their
+    type: a string directly, anything else as it will render - the `details` dict
+    a refusal logs holds the address somebody submitted. The stock formatter
+    prints none of them; the one `configure_log_output` installs does, and so
+    would a JSON or key-value formatter, the ordinary production choice. Neither
+    may acquire a hole by being what renders them.
 
     Usage:
         logging.getLogger().addFilter(PiiRedactionFilter())
@@ -224,8 +226,8 @@ class PiiRedactionFilter(logging.Filter):
         # Anything a call site added through `extra=`, which arrives as an
         # attribute on the record rather than in `msg` or `args`.
         for key, value in record.__dict__.items():
-            if key not in _STANDARD_RECORD_KEYS and isinstance(value, str):
-                record.__dict__[key] = self._redact(value)
+            if key not in _STANDARD_RECORD_KEYS:
+                record.__dict__[key] = self._redact_extra(value)
         return True
 
     def _redact(self, value: str) -> str:
@@ -249,6 +251,21 @@ class PiiRedactionFilter(logging.Filter):
         rendered = str(value)
         redacted = self._redact(rendered)
         return value if redacted == rendered else redacted
+
+    def _redact_extra(self, value: object) -> object:
+        """A field passed through `extra=`, redacted the way a formatter will render it.
+
+        What `_redact_arg` does for a format argument, with one more case. A filter
+        runs in the caller's frame, so an object that cannot be rendered - a row whose
+        `__repr__` reads an expired attribute - would raise out of `logger.info` and
+        not out of the handler, where the standard library catches it
+        (`Handler.handleError`). The field is replaced by its type instead, because a
+        log call must not take its caller down.
+        """
+        try:
+            return self._redact_arg(value)
+        except Exception:
+            return f"<{type(value).__name__}: could not be printed>"
 
 
 @overload
@@ -357,10 +374,10 @@ class _OutputFormatter(logging.Formatter):
 
     def formatMessage(self, record: logging.LogRecord) -> str:
         message = super().formatMessage(record)
-        # `PiiRedactionFilter` has already redacted and escaped a string. This is for
-        # a value that is not one, whose `str()` can carry a line break of its own.
+        # Redacted and escaped already: `configure_log_output` puts `PiiRedactionFilter`
+        # on the handler this formatter belongs to, and it covers every type.
         fields = [
-            f"{key}={_escape_line_breakers(str(value))}"
+            f"{key}={value}"
             for key, value in record.__dict__.items()
             if key not in _STANDARD_RECORD_KEYS
         ]

@@ -31,7 +31,9 @@ from app.worker.attempt import Attempt, running
 from app.worker.errors import describe
 from app.worker.registry import Handlers
 
-logger = logging.getLogger(__name__)
+# Not `__name__`: the parent spawns this with `python -m app.worker.child`, which makes
+# that "__main__" - a logger outside the `app` tree `LOG_LEVEL` governs.
+logger = logging.getLogger("app.worker.child")
 
 READY = '{"ready": true}'
 

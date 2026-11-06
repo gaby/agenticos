@@ -35,7 +35,9 @@ from app.worker.jobs import Pool
 from app.worker.listener import asyncpg_dsn, listener
 from app.worker.runtime import Worker, WorkerSettings
 
-logger = logging.getLogger(__name__)
+# Not `__name__`: under `python -m app.worker` that is "__main__", a logger outside the
+# `app` tree, which is the one `LOG_LEVEL` governs.
+logger = logging.getLogger("app.worker.__main__")
 
 
 def pools_from(value: str) -> list[Pool]:

@@ -128,6 +128,88 @@ def test_a_value_passed_through_extra_is_escaped_too(root_stream):
 
 
 @pytest.mark.security
+def test_a_container_passed_through_extra_is_redacted_as_it_renders():
+    """The filter scrubbed a string extra and left a dict alone, which was safe while
+    nothing printed an extra. `app_exception_handler` logs `details`, a dict, and a
+    service puts the address somebody submitted in it."""
+    record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "ALREADY_EXISTS", None, None)
+    record.details = {"email": "alice@example.com", "attempts": 3, "key": _SAMPLE_VALUE}
+
+    PiiRedactionFilter().filter(record)
+
+    assert (
+        record.details
+        == "{'email': '[EMAIL_REDACTED]', 'attempts': 3, 'key': '[API_KEY_REDACTED]'}"
+    )
+
+
+def test_an_extra_that_needs_no_redaction_keeps_its_type():
+    """A JSON formatter wants the dict as a dict and the id as an id."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+    ident, counts = uuid4(), {"attempts": 3}
+    record.call_id, record.counts, record.n, record.flag, record.nothing = (
+        ident,
+        counts,
+        3,
+        True,
+        None,
+    )
+
+    PiiRedactionFilter().filter(record)
+
+    assert record.call_id is ident
+    assert record.counts is counts
+    assert (record.n, record.flag, record.nothing) == (3, True, None)
+
+
+def test_an_extra_that_cannot_be_printed_does_not_break_the_logging_call():
+    """A filter runs in the caller's frame, so an object whose `__repr__` raises - a row
+    whose attribute expired - would surface from `logger.info` and not from the handler,
+    where the standard library catches it."""
+
+    class Detached:
+        def __str__(self) -> str:
+            raise RuntimeError("instance is not bound to a Session")
+
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+    record.row = Detached()
+
+    PiiRedactionFilter().filter(record)
+
+    assert record.row == "<Detached: could not be printed>"
+
+
+def test_a_module_run_as_main_does_not_name_its_logger_after_itself():
+    """`python -m app.worker` runs with `__name__ == "__main__"`, so `getLogger(__name__)`
+    there is a logger called `__main__`: outside the `app` tree `LOG_LEVEL` governs, so
+    its INFO lines are dropped and its errors print whatever the level is."""
+    import ast
+    from pathlib import Path
+
+    offenders: list[str] = []
+    for source in sorted((Path(__file__).resolve().parents[1] / "app").rglob("*.py")):
+        tree = ast.parse(source.read_text())
+        runs_as_main = source.name == "__main__.py" or any(
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            for node in ast.walk(tree)
+        )
+        offenders += [
+            f"{source.name}:{node.lineno}"
+            for node in ast.walk(tree)
+            if runs_as_main
+            and isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "getLogger"
+            and [getattr(arg, "id", None) for arg in node.args] == ["__name__"]
+        ]
+
+    assert offenders == [], "name the logger 'app.<package>.<module>' explicitly"
+
+
+@pytest.mark.security
 @pytest.mark.parametrize(
     "path",
     [
@@ -795,6 +877,27 @@ class TestLogOutput:
                     time.tzset()
 
         assert formatted == "1970-01-02T00:00:00Z INFO app.x: m"
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_refusal_s_details_are_redacted_in_the_line(self):
+        """The reproduction from review: a duplicate sign-up is refused with the address
+        in `details`, and the handler logs `details` as an extra."""
+        from app.api.exception_handlers import app_exception_handler
+        from app.core.exceptions import AlreadyExistsError
+        from tests.api.test_error_envelope import _HttpConnection
+
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            await app_exception_handler(
+                _HttpConnection(),
+                AlreadyExistsError(
+                    message="Email already registered", details={"email": "alice@example.com"}
+                ),
+            )
+
+        assert "alice@example.com" not in stderr.getvalue()
+        assert "details={'email': '[EMAIL_REDACTED]'}" in stderr.getvalue()
 
     def test_the_handler_is_installed_once(self):
         """The API's lifespan, the worker and each ingest child all call it."""
