@@ -1,5 +1,5 @@
 ---
-source_sha: "81e337178b21"
+source_sha: "8f1abc47bca1"
 ---
 
 # Konfiguration { #configuration }
@@ -49,6 +49,7 @@ Die Konfiguration lehnt einen nicht gesetzten `VAULT_MASTER_KEY` außerhalb von 
 | `API_V1_STR` | `/api/v1` | Präfix der API-Version |
 | `DEBUG` | `false` | Debug-Modus einschalten (ausführliche Fehler, Auto-Reload) |
 | `ENVIRONMENT` | `local` | Eines von: `development`, `local`, `staging`, `production` |
+| `LOG_LEVEL` | `INFO` | Wie viel vom eigenen Log der Anwendung ausgegeben wird: `DEBUG`, `INFO`, `WARNING`, `ERROR` oder `CRITICAL`, in beliebiger Groß- und Kleinschreibung. Bibliotheken bleiben bei `WARNING`. Siehe [Logs](#logs) |
 | `TIMEZONE` | `UTC` | IANA-Zeitzone (z. B. `UTC`, `Europe/Warsaw`, `America/New_York`) |
 | `MODELS_CACHE_DIR` | `./models_cache` | Verzeichnis für zwischengespeicherte ML-Modelle |
 | `MEDIA_DIR` | `./media` | Verzeichnis für hochgeladene Dateien |
@@ -653,6 +654,36 @@ der Vorlage entfernt; sie zu setzen bewirkt heute nichts.
 
 Die eine Modell-Zugangsinformation, die in der Umgebung bleibt, ist der Key für
 die Embeddings — siehe RAG weiter unten.
+
+## Logs { #logs }
+
+Die Container `app` und `worker` schreiben ihr Log auf die Standardfehlerausgabe;
+das zeigt `docker compose logs app worker`. Eine Zeile beginnt mit der Zeit in UTC,
+dem Level und dem Namen des Loggers. Ein Fehler nennt seine Ursache in der
+Traceback-Zeile, die ihm folgt:
+
+```text
+2026-11-06T12:34:56Z WARNING app.services.model_catalog: Could not list models for otari; and there is no curated list to fall back to
+Traceback (most recent call last):\n  File "...", line 539, in _listed\n ...\nhttpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
+```
+
+Ein Aufruf, der Felder übergibt, bekommt sie als `key=value` an die Meldung
+angehängt. Ein Traceback ist eine einzige Zeile, deren Zeilenumbrüche als `\n`
+geschrieben werden, sodass ein von jemandem eingereichter Wert keinen eigenen
+Eintrag beginnen kann. E-Mail-Adressen, Tokens, API-Keys und signierte Links werden
+maskiert, bevor eine Zeile geschrieben wird.
+
+`LOG_LEVEL` legt fest, wie viel vom eigenen Log der Anwendung ausgegeben wird,
+standardmäßig `INFO`; `WARNING` gibt nur aus, was schiefgegangen ist. Bibliotheken
+bleiben unabhängig davon bei `WARNING`, weil httpx bei `INFO` jede URL schreibt,
+die es abruft, samt Query-String. Startet der Betreiber die API mit einer eigenen
+`--log-config`, oder setzt etwas anderes einen Handler auf den Root-Logger, hat
+`LOG_LEVEL` keine Wirkung, und das Log ist Sache des Betreibers.
+
+Außerhalb von `ENVIRONMENT=production` schreibt Logfire außerdem für jeden Span eine
+Zeile, etwa vierzig pro Anfrage, und sie begraben die Einträge oben. Mit
+`LOGFIRE_CONSOLE=false` werden sie abgeschaltet; die Produktion hat sie schon aus.
+Siehe [Observability](#observability-logfire).
 
 ## Observability (Logfire) { #observability-logfire }
 

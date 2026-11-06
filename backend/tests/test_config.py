@@ -28,6 +28,22 @@ class TestDefaultOrgBudget:
             Settings(DEFAULT_ORG_MONTHLY_BUDGET_USD=bad)
 
 
+class TestLogLevel:
+    def test_info_is_the_default(self):
+        assert Settings().LOG_LEVEL == "INFO"
+
+    @pytest.mark.parametrize("written", ["debug", "Warning", " error ", "CRITICAL"])
+    def test_a_level_is_accepted_in_any_case(self, written):
+        """`LOG_LEVEL=info` is how most people write it; refusing it would stop the API
+        from starting over a capital letter."""
+        assert written.strip().upper() == Settings(LOG_LEVEL=written).LOG_LEVEL
+
+    @pytest.mark.parametrize("bad", ["verbose", "", "10", 20])
+    def test_anything_that_is_not_a_level_is_refused(self, bad):
+        with pytest.raises(ValidationError):
+            Settings(LOG_LEVEL=bad)
+
+
 class TestDetachedChatTurn:
     def test_two_hours_is_the_longest_a_left_turn_may_run(self):
         """Past `RUNNING_HORIZON` the conversation list stops calling the run at

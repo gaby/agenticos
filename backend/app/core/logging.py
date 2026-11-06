@@ -1,7 +1,9 @@
-"""Logging utilities - the filter every handler carries: PII, and forged lines."""
+"""Logging utilities: the filter every handler carries (PII, forged lines), and where the log is printed."""
 
 import logging
 import re
+import sys
+import time
 from typing import ClassVar, overload
 
 #: Bytes that end a log line, or move a terminal reading one.
@@ -333,3 +335,65 @@ def _add_redaction(filterer: logging.Filterer) -> None:
     """Put one redaction filter on a logger or a handler, unless it has one."""
     if not any(isinstance(f, PiiRedactionFilter) for f in filterer.filters):
         filterer.addFilter(PiiRedactionFilter())
+
+
+_OUTPUT_HANDLER_NAME = "agenticos-output"
+"""What `configure_log_output` calls its handler, so a second call finds it."""
+
+_OUTPUT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_OUTPUT_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+class _OutputFormatter(logging.Formatter):
+    """`time LEVEL logger: message key=value ...`, with the time in UTC.
+
+    The pairs are what the call passed as `extra=`. This code base logs an event name
+    and keeps the detail there - `logger.exception("voice_call_failed",
+    extra={"call_id": ...})` - and the stock formatter prints none of it, so the line
+    said that something failed and not which call.
+    """
+
+    converter = time.gmtime
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        message = super().formatMessage(record)
+        # `PiiRedactionFilter` has already redacted and escaped a string. This is for
+        # a value that is not one, whose `str()` can carry a line break of its own.
+        fields = [
+            f"{key}={_escape_line_breakers(str(value))}"
+            for key, value in record.__dict__.items()
+            if key not in _STANDARD_RECORD_KEYS
+        ]
+        return " ".join([message, *fields])
+
+
+def configure_log_output(level: str) -> None:
+    """Print this application's log to stderr, readably, in a process with no handler of its own.
+
+    Nothing in the application installs a root handler and uvicorn configures only
+    its own loggers, so under `uvicorn app.main:app` Python's last-resort handler was
+    all there was: it printed what reached WARNING as a bare message, with no time,
+    level or logger name, and dropped everything below. An `INFO` line, such as an
+    agent turn being refused, was never printed.
+
+    `level` is the threshold for the `app` loggers only. Libraries stay at the root's
+    WARNING: at `INFO` httpx writes every URL it requests, query string included, and
+    scrubbing a library's lines is not something this module can promise.
+
+    A process that already has a root handler - an operator's `--log-config`, a test
+    runner's capture - keeps its own logging, as with `logging.basicConfig`. Calling
+    this again is safe: the handler is found by name and only the level is set again.
+
+    Args:
+        level: A level name `logging` accepts, such as `"INFO"`.
+    """
+    root = logging.getLogger()
+    if not any(handler.get_name() == _OUTPUT_HANDLER_NAME for handler in root.handlers):
+        if root.handlers:
+            return
+        handler = logging.StreamHandler(sys.stderr)
+        handler.set_name(_OUTPUT_HANDLER_NAME)
+        handler.setFormatter(_OutputFormatter(_OUTPUT_FORMAT, datefmt=_OUTPUT_DATE_FORMAT))
+        _add_redaction(handler)
+        root.addHandler(handler)
+    logging.getLogger("app").setLevel(level)

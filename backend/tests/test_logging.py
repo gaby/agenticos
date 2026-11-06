@@ -13,9 +13,14 @@ import copy
 import io
 import logging
 import logging.config
+import re
 import secrets
+import sys
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
+from typing import NoReturn
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -29,6 +34,7 @@ from uvicorn.logging import DefaultFormatter
 from app.core.logging import (
     SECRET_PATH_MARKER,
     PiiRedactionFilter,
+    configure_log_output,
     one_line,
     redact_secret_paths,
     setup_logging,
@@ -625,3 +631,208 @@ def test_signed_discord_download_queries_do_not_escape_through_exception_logs(
     assert "query-signature" not in emitted
     assert redact_secret_paths(url) == path + "?[REDACTED]"
     assert redact_secret_paths(path + "?[REDACTED]") == path + "?[REDACTED]"
+
+
+@contextmanager
+def bare_root() -> Iterator[io.StringIO]:
+    """The root logger as `uvicorn app.main:app` leaves it - no handler - and stderr captured.
+
+    A context manager and not a fixture: pytest puts its capture handlers on the root
+    again at the start of each phase, so a fixture's bare root is gone by the time the
+    test body runs. Handlers and levels are put back on the way out, so nothing
+    `configure_log_output` installs outlives the test.
+    """
+    root, application = logging.getLogger(), logging.getLogger("app")
+    saved = (list(root.handlers), root.level, application.level)
+    for handler in saved[0]:
+        root.removeHandler(handler)
+    root.setLevel(logging.WARNING)
+    application.setLevel(logging.NOTSET)
+    stream = io.StringIO()
+    try:
+        with patch.object(sys, "stderr", stream):
+            yield stream
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in saved[0]:
+            root.addHandler(handler)
+        root.setLevel(saved[1])
+        application.setLevel(saved[2])
+
+
+def _fail_with(error: Exception) -> NoReturn:
+    raise error
+
+
+class TestLogOutput:
+    """Where the application's own log goes in a process that configured nothing.
+
+    Under `uvicorn app.main:app` that was Python's last-resort handler: WARNING and above,
+    as a bare message, and everything below it dropped. So an `INFO` line, and the
+    time, level and logger of every other, were never in `docker compose logs`.
+    """
+
+    def test_a_line_names_its_time_level_and_logger(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.agent_session").info("Agent turn refused: no agent")
+
+        assert re.fullmatch(
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ INFO app\.services\.agent_session: "
+            r"Agent turn refused: no agent\n",
+            stderr.getvalue(),
+        )
+
+    def test_the_level_is_the_threshold_of_the_applications_own_loggers(self):
+        with bare_root() as stderr:
+            configure_log_output("WARNING")
+            agent = logging.getLogger("app.services.agent")
+            agent.info("connected")
+            agent.warning("could not reach the provider")
+
+        assert "connected" not in stderr.getvalue()
+        assert "could not reach the provider" in stderr.getvalue()
+
+    def test_a_library_stays_at_warning_whatever_the_level_is(self):
+        """httpx writes `HTTP Request: GET <url>` at `INFO`, query string included, and
+        a library's line is not one this module can promise to scrub."""
+        with bare_root() as stderr:
+            configure_log_output("DEBUG")
+            library = logging.getLogger("httpx")
+            library.info('HTTP Request: GET https://x.example/models?key=abc "200 OK"')
+            library.warning("a library warning")
+
+        assert "HTTP Request" not in stderr.getvalue()
+        assert "a library warning" in stderr.getvalue()
+
+    def test_what_a_call_passed_as_extra_follows_the_message(self):
+        """The code base logs an event name and puts the detail in `extra`, which the
+        stock formatter never printed - `voice_call_failed`, and not which call."""
+        call_id = uuid4()
+
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.voice.session").info(
+                "voice_call_failed", extra={"call_id": call_id, "attempt": 3}
+            )
+
+        assert stderr.getvalue().endswith(f" voice_call_failed call_id={call_id} attempt=3\n")
+        assert "levelname=" not in stderr.getvalue()
+        assert "asctime=" not in stderr.getvalue()
+
+    @pytest.mark.security
+    def test_a_value_in_extra_cannot_start_an_entry_of_its_own(self):
+        """A string is escaped by the filter; an object is escaped as it is rendered,
+        because its `str()` is not something the filter ever saw."""
+
+        class Chatty:
+            def __str__(self) -> str:
+                return "x\n2026-01-01T00:00:00Z CRITICAL app.audit: admin promoted somebody"
+
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.x").warning(
+                "event", extra={"who": Chatty(), "caller": "id:nobody\r\n2026-01-01 FORGED"}
+            )
+
+        assert stderr.getvalue().count("\n") == 1, "one entry, on one line"
+        assert "who=x\\n2026-01-01T00:00:00Z CRITICAL app.audit" in stderr.getvalue()
+        assert "caller=id:nobody\\r\\n2026-01-01 FORGED" in stderr.getvalue()
+
+    @pytest.mark.security
+    def test_the_handler_redacts_a_message_and_the_traceback_that_follows_it(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            failing = logging.getLogger("app.services.rag.ingestion")
+            failing.error(REDACTABLE_LINE)
+            try:
+                _fail_with(
+                    RuntimeError(f"POST https://api.example.com refused; key {_SAMPLE_VALUE}")
+                )
+            except RuntimeError:
+                failing.exception("Ingestion failed")
+
+        emitted = stderr.getvalue()
+        assert "[API_KEY_REDACTED]" in emitted
+        assert "[EMAIL_REDACTED]" in emitted
+        assert _SAMPLE_VALUE not in emitted
+        assert "a@b.com" not in emitted
+        assert "Traceback (most recent call last)" in emitted
+
+    def test_a_failure_is_two_lines_the_entry_and_its_traceback(self):
+        """A traceback's own newlines are written out, so the whole of it is one line."""
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            try:
+                _fail_with(ConnectionError("[SSL: CERTIFICATE_VERIFY_FAILED]"))
+            except ConnectionError:
+                logging.getLogger("app.services.model_catalog").warning(
+                    "Could not list models", exc_info=True
+                )
+
+        entry, traceback = stderr.getvalue().splitlines()
+        assert entry.endswith("WARNING app.services.model_catalog: Could not list models")
+        assert traceback.startswith("Traceback (most recent call last)")
+        assert "CERTIFICATE_VERIFY_FAILED" in traceback
+
+    def test_the_time_is_utc_whatever_zone_the_container_is_in(self, monkeypatch):
+        record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+        record.created = 86_400.0
+
+        with bare_root():
+            configure_log_output("INFO")
+            handler = next(
+                h for h in logging.getLogger().handlers if h.get_name() == "agenticos-output"
+            )
+            with monkeypatch.context() as zone:
+                zone.setenv("TZ", "Asia/Kolkata")
+                time.tzset()
+                try:
+                    formatted = handler.format(record)
+                finally:
+                    zone.undo()
+                    time.tzset()
+
+        assert formatted == "1970-01-02T00:00:00Z INFO app.x: m"
+
+    def test_the_handler_is_installed_once(self):
+        """The API's lifespan, the worker and each ingest child all call it."""
+        with bare_root():
+            configure_log_output("INFO")
+            configure_log_output("DEBUG")
+            ours = [h for h in logging.getLogger().handlers if h.get_name() == "agenticos-output"]
+            level = logging.getLogger("app").level
+
+        assert len(ours) == 1
+        assert sum(isinstance(f, PiiRedactionFilter) for f in ours[0].filters) == 1
+        assert level == logging.DEBUG, "the second call sets the level again"
+
+    def test_a_process_with_a_handler_of_its_own_is_left_alone(self):
+        """An operator's `--log-config`, or a test runner's capture: as `basicConfig`
+        does, a root handler somebody else installed means logging is theirs."""
+        own = logging.StreamHandler(io.StringIO())
+
+        with bare_root():
+            logging.getLogger().addHandler(own)
+            configure_log_output("DEBUG")
+            handlers = list(logging.getLogger().handlers)
+            level = logging.getLogger("app").level
+
+        assert handlers == [own]
+        assert level == logging.NOTSET
+
+
+@pytest.mark.anyio
+async def test_the_lifespan_prints_the_applications_log_at_the_configured_level(monkeypatch):
+    """The API is the process whose log `docker compose logs app` shows."""
+    from app import main
+    from tests.test_lifespan_drain import _stub_startup
+
+    _stub_startup(monkeypatch)
+    monkeypatch.setattr(main.settings, "LOG_LEVEL", "DEBUG")
+
+    async with main.lifespan(FastAPI()):
+        pass
+
+    main.configure_log_output.assert_called_once_with("DEBUG")

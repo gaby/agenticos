@@ -19,6 +19,21 @@ Two things are versioned separately from this file and worth knowing about:
 
 ## [Unreleased]
 
+### Added
+
+- **A container log you can read, and `LOG_LEVEL`.** The API, the worker and its
+  ingest children now print the application's log to standard error with the
+  time, level and logger on every line, and the fields a call passed as `extra=`
+  after the message. Nothing installed a log handler before and uvicorn
+  configures only its own loggers, so `docker compose logs app` showed what
+  reached `WARNING` as a bare message and never showed an `INFO` line at all.
+  `LOG_LEVEL` (default `INFO`) sets the threshold for the application's own
+  loggers; libraries stay at `WARNING`, because at `INFO` httpx writes every URL
+  it requests. A process that already has a root log handler, such as one
+  configured with `--log-config`, keeps it. A deployment will see more lines
+  than before: `LOG_LEVEL=WARNING` restores the old volume. Outside production,
+  `LOGFIRE_CONSOLE=false` switches off the span lines that bury these entries.
+
 ### Fixed
 
 - **A failed model listing now says why in the log.** When the provider's model

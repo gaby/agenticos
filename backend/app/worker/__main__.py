@@ -25,7 +25,7 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.core.logfire_setup import setup_worker_observability
-from app.core.logging import setup_logging
+from app.core.logging import configure_log_output, setup_logging
 from app.db.session import claim_pooled_engines, close_db, get_db_context
 from app.services.background_jobs import tell_owners_paused
 from app.worker import jobs, schedules
@@ -131,7 +131,9 @@ def main() -> None:
     args = parser.parse_args()
     pools = pools_from(args.pools)
     # The worker runs ingestion, syncs and reports - the code most likely to log a
-    # connector 401 or an embedding-key failure - so it redacts like the API does (#440).
+    # connector 401 or an embedding-key failure - so it redacts like the API does (#440),
+    # and prints what it logs somewhere a person can read it.
+    configure_log_output(settings.LOG_LEVEL)
     setup_logging()
     setup_worker_observability()
     asyncio.run(serve(pools))

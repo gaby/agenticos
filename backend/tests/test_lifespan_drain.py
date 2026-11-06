@@ -60,6 +60,7 @@ def _stub_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     from app import main
 
     for name in (
+        "configure_log_output",
         "setup_logfire",
         "load_builtins",
         "instrument_asyncpg",

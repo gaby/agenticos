@@ -112,8 +112,11 @@ def main(
     replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
-    from app.core.logging import setup_logging
+    from app.core.config import settings
+    from app.core.logging import configure_log_output, setup_logging
 
+    # stderr, which the parent leaves alone: stdout is the reply channel (above).
+    configure_log_output(settings.LOG_LEVEL)
     setup_logging()
     handlers = load_handlers(argv[1] if len(argv) > 1 else "app.worker.handlers:ingest")
     asyncio.run(serve(handlers, sys.stdin, replies))
