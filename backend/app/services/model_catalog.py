@@ -470,10 +470,14 @@ async def models_for(
         # What is said has to match what is answered: for a provider with no
         # curated entry there is no list to fall back to, and a log line during
         # an outage claiming there was is the opposite account of the response.
+        # `exc_info` carries the cause - a refused certificate, a DNS failure, a
+        # 401 - which the fallback otherwise hides from everyone: the dropdown
+        # simply shows the curated list.
         logger.warning(
             "Could not list models for %s; %s",
             provider,
             "using the curated list" if curated else "and there is no curated list to fall back to",
+            exc_info=True,
         )
         return _fallback(curated)
 
@@ -508,7 +512,9 @@ async def embedding_models_at(base_url: str) -> tuple[CatalogModel, ...] | None:
         # catalog - the endpoint's problem, and an unanswered question. Anything
         # else is a defect here and propagates: read as "unconfirmed" it would
         # let the validation this answer feeds wave every model through.
-        logger.warning("Could not list the embedding models of a custom OpenRouter endpoint")
+        logger.warning(
+            "Could not list the embedding models of a custom OpenRouter endpoint", exc_info=True
+        )
         return None
     return tuple(models)
 

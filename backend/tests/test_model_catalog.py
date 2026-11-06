@@ -129,6 +129,22 @@ class TestWhenTheProviderWillNotSay:
         assert models == list(curated_models("openrouter"))
 
     @pytest.mark.anyio
+    async def test_a_failed_call_logs_why_it_failed(self, caplog: pytest.LogCaptureFixture):
+        """The dropdown quietly shows the curated list, so the log is the only place
+        an untrusted certificate or an unreachable gateway is ever visible."""
+        client = _responds({})
+        client.get = AsyncMock(side_effect=httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]"))
+        with (
+            caplog.at_level("WARNING", logger=MODULE),
+            patch(f"{MODULE}.httpx.AsyncClient", return_value=client),
+        ):
+            await models_for("openrouter")
+
+        (record,) = [r for r in caplog.records if r.name == MODULE]
+        assert record.exc_info is not None
+        assert "CERTIFICATE_VERIFY_FAILED" in str(record.exc_info[1])
+
+    @pytest.mark.anyio
     async def test_an_empty_listing_is_treated_as_no_answer(self):
         """A provider answering `[]` leaves the field with nothing to suggest,
         and the curated list is a better nothing."""
@@ -756,6 +772,22 @@ async def test_an_endpoint_that_cannot_be_asked_is_none_and_one_listing_nothing_
             assert await model_catalog.embedding_models_at("https://x.example/v1") == ()
 
     assert model_catalog._cache == {}
+
+
+@pytest.mark.anyio
+async def test_an_embedding_listing_that_fails_logs_why(caplog: pytest.LogCaptureFixture):
+    with (
+        caplog.at_level("WARNING", logger=MODULE),
+        patch(
+            f"{MODULE}._fetch",
+            AsyncMock(side_effect=httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]")),
+        ),
+    ):
+        assert await model_catalog.embedding_models_at("https://x.example/v1") is None
+
+    (record,) = [r for r in caplog.records if r.name == MODULE]
+    assert record.exc_info is not None
+    assert "CERTIFICATE_VERIFY_FAILED" in str(record.exc_info[1])
 
 
 class TestTheOrderAPickerShows:

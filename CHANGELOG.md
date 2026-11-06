@@ -19,6 +19,14 @@ Two things are versioned separately from this file and worth knowing about:
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed model listing now says why in the log.** When the provider's model
+  list could not be fetched, the console quietly showed the curated list and the
+  warning carried no cause, so an untrusted certificate or an unreachable gateway
+  left nothing to read. The warning now includes the traceback, for the model
+  picker and for the embedding model check on a custom OpenRouter endpoint.
+
 ## [1.49.0] - 2026-11-05
 
 ### Added
