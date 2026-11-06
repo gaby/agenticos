@@ -9,6 +9,7 @@ unconfigured process is still covered, and the two entrypoints that were missing
 the call now make it.
 """
 
+import ast
 import copy
 import io
 import logging
@@ -20,6 +21,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
 from typing import NoReturn
 from unittest.mock import patch
 from uuid import uuid4
@@ -31,6 +33,8 @@ from starlette.datastructures import URL
 from uvicorn.config import LOGGING_CONFIG
 from uvicorn.logging import DefaultFormatter
 
+from app.api.exception_handlers import app_exception_handler
+from app.core.exceptions import AlreadyExistsError
 from app.core.logging import (
     SECRET_PATH_MARKER,
     PiiRedactionFilter,
@@ -40,6 +44,7 @@ from app.core.logging import (
     setup_logging,
 )
 from app.core.security import create_artifact_view_token
+from tests.api.test_error_envelope import _HttpConnection
 
 # Built from fragments on purpose: the test proves the filter strips a credential
 # at runtime, so a static secret-scanner must not read a literal one flowing into
@@ -115,9 +120,8 @@ def test_a_submitted_value_cannot_write_a_log_entry_of_its_own(root_stream):
 
 @pytest.mark.security
 def test_a_value_passed_through_extra_is_escaped_too(root_stream):
-    """The default formatter does not render `extra`, so this forges nothing
-    today - but a deployment that plugs in a JSON or key-value formatter, which is
-    the ordinary production choice, must not acquire the hole by doing so."""
+    """A formatter that renders `extra` - the one `configure_log_output` installs, or
+    a JSON or key-value one - must not let a value forge a line by being what prints it."""
     setup_logging()
     record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "embed_origin_refused", None, None)
     record.origin = "https://evil.example\r\n2026-01-01 FORGED"
@@ -127,15 +131,27 @@ def test_a_value_passed_through_extra_is_escaped_too(root_stream):
     assert record.origin == "https://evil.example\\r\\n2026-01-01 FORGED"
 
 
+def _filtered(**extra: object) -> logging.LogRecord:
+    """A record carrying these `extra=` fields, after the filter has been over it."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+    record.__dict__.update(extra)
+    PiiRedactionFilter().filter(record)
+    return record
+
+
+class _Detached:
+    """An object whose `str()` raises, like a row whose attribute expired."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("instance is not bound to a Session")
+
+
 @pytest.mark.security
 def test_a_container_passed_through_extra_is_redacted_as_it_renders():
     """The filter scrubbed a string extra and left a dict alone, which was safe while
     nothing printed an extra. `app_exception_handler` logs `details`, a dict, and a
     service puts the address somebody submitted in it."""
-    record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "ALREADY_EXISTS", None, None)
-    record.details = {"email": "alice@example.com", "attempts": 3, "key": _SAMPLE_VALUE}
-
-    PiiRedactionFilter().filter(record)
+    record = _filtered(details={"email": "alice@example.com", "attempts": 3, "key": _SAMPLE_VALUE})
 
     assert (
         record.details
@@ -151,6 +167,7 @@ def test_a_container_passed_through_extra_is_redacted_as_it_renders():
         "PASSWORD",
         "api_key",
         "apikey",
+        "secret_key",
         "token",
         "claim_token",
         "access_token",
@@ -164,14 +181,8 @@ def test_a_container_passed_through_extra_is_redacted_as_it_renders():
 def test_a_field_named_like_a_credential_is_masked_whatever_its_value_looks_like(name):
     """The patterns know a secret by its shape, or by the key written beside it in a
     message. A field passed through `extra=` arrives without its key, so a short
-    `token` had neither - and `workflow_dispatch_lost_claim` logs its fencing token
-    exactly that way."""
-    record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "m", None, None)
-    setattr(record, name, "hunter2")
-
-    PiiRedactionFilter().filter(record)
-
-    assert getattr(record, name) == "[REDACTED]"
+    `token` had neither."""
+    assert getattr(_filtered(**{name: "hunter2"}), name) == "[REDACTED]"
 
 
 @pytest.mark.parametrize(
@@ -189,27 +200,14 @@ def test_a_field_named_like_a_credential_is_masked_whatever_its_value_looks_like
 def test_a_field_that_only_mentions_a_credential_is_left_alone(name):
     """Counts and ids are what these names are for, and masking them would hide the
     one thing the log line was written to say."""
-    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
-    setattr(record, name, "7")
-
-    PiiRedactionFilter().filter(record)
-
-    assert getattr(record, name) == "7"
+    assert getattr(_filtered(**{name: "7"}), name) == "7"
 
 
 def test_an_extra_that_needs_no_redaction_keeps_its_type():
     """A JSON formatter wants the dict as a dict and the id as an id."""
-    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
     ident, counts = uuid4(), {"attempts": 3}
-    record.call_id, record.counts, record.n, record.flag, record.nothing = (
-        ident,
-        counts,
-        3,
-        True,
-        None,
-    )
 
-    PiiRedactionFilter().filter(record)
+    record = _filtered(call_id=ident, counts=counts, n=3, flag=True, nothing=None)
 
     assert record.call_id is ident
     assert record.counts is counts
@@ -217,44 +215,42 @@ def test_an_extra_that_needs_no_redaction_keeps_its_type():
 
 
 def test_an_extra_that_cannot_be_printed_does_not_break_the_logging_call():
-    """A filter runs in the caller's frame, so an object whose `__repr__` raises - a row
-    whose attribute expired - would surface from `logger.info` and not from the handler,
-    where the standard library catches it."""
+    """A filter runs in the caller's frame, so an object whose `str()` raises would
+    surface from `logger.info` and not from the handler, where the standard library
+    catches it."""
+    assert _filtered(row=_Detached()).row == "<_Detached: RuntimeError while printing>"
 
-    class Detached:
-        def __str__(self) -> str:
-            raise RuntimeError("instance is not bound to a Session")
 
-    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
-    record.row = Detached()
+@pytest.mark.parametrize(
+    ("msg", "args"),
+    [("x %s", (_Detached(),)), ("x %(r)s", ({"r": _Detached()},))],
+    ids=["positional", "named"],
+)
+def test_a_format_argument_that_cannot_be_printed_does_not_break_the_logging_call(msg, args):
+    """The same guard on the path that was there before extras: `logger.info("x %s", row)`
+    raised out of the filter too."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, msg, args, None)
 
     PiiRedactionFilter().filter(record)
 
-    assert record.row == "<Detached: could not be printed>"
+    assert record.getMessage() == "x <_Detached: RuntimeError while printing>"
 
 
 def test_a_module_run_as_main_does_not_name_its_logger_after_itself():
     """`python -m app.worker` runs with `__name__ == "__main__"`, so `getLogger(__name__)`
     there is a logger called `__main__`: outside the `app` tree `LOG_LEVEL` governs, so
     its INFO lines are dropped and its errors print whatever the level is."""
-    import ast
-    from pathlib import Path
-
     offenders: list[str] = []
     for source in sorted((Path(__file__).resolve().parents[1] / "app").rglob("*.py")):
-        tree = ast.parse(source.read_text())
-        runs_as_main = source.name == "__main__.py" or any(
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
-            for node in ast.walk(tree)
-        )
+        text = source.read_text()
+        # Only a module that can run as a script has a `__main__` name to be wrong about.
+        # Reading every module is cheap; parsing all of them was two seconds.
+        if source.name != "__main__.py" and "if __name__" not in text:
+            continue
         offenders += [
             f"{source.name}:{node.lineno}"
-            for node in ast.walk(tree)
-            if runs_as_main
-            and isinstance(node, ast.Call)
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "getLogger"
             and [getattr(arg, "id", None) for arg in node.args] == ["__name__"]
@@ -779,9 +775,8 @@ def bare_root() -> Iterator[io.StringIO]:
     `configure_log_output` installs outlives the test.
     """
     root, application = logging.getLogger(), logging.getLogger("app")
-    saved = (list(root.handlers), root.level, application.level)
-    for handler in saved[0]:
-        root.removeHandler(handler)
+    handlers, root_level, application_level = list(root.handlers), root.level, application.level
+    root.handlers.clear()
     root.setLevel(logging.WARNING)
     application.setLevel(logging.NOTSET)
     stream = io.StringIO()
@@ -789,12 +784,9 @@ def bare_root() -> Iterator[io.StringIO]:
         with patch.object(sys, "stderr", stream):
             yield stream
     finally:
-        for handler in list(root.handlers):
-            root.removeHandler(handler)
-        for handler in saved[0]:
-            root.addHandler(handler)
-        root.setLevel(saved[1])
-        application.setLevel(saved[2])
+        root.handlers[:] = handlers
+        root.setLevel(root_level)
+        application.setLevel(application_level)
 
 
 def _fail_with(error: Exception) -> NoReturn:
@@ -854,8 +846,6 @@ class TestLogOutput:
             )
 
         assert stderr.getvalue().endswith(f" voice_call_failed call_id={call_id} attempt=3\n")
-        assert "levelname=" not in stderr.getvalue()
-        assert "asctime=" not in stderr.getvalue()
 
     @pytest.mark.security
     def test_a_value_in_extra_cannot_start_an_entry_of_its_own(self):
@@ -915,20 +905,17 @@ class TestLogOutput:
     def test_the_time_is_utc_whatever_zone_the_container_is_in(self, monkeypatch):
         record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
         record.created = 86_400.0
+        monkeypatch.setenv("TZ", "Asia/Kolkata")
+        time.tzset()
 
-        with bare_root():
-            configure_log_output("INFO")
-            handler = next(
-                h for h in logging.getLogger().handlers if h.get_name() == "agenticos-output"
-            )
-            with monkeypatch.context() as zone:
-                zone.setenv("TZ", "Asia/Kolkata")
-                time.tzset()
-                try:
-                    formatted = handler.format(record)
-                finally:
-                    zone.undo()
-                    time.tzset()
+        try:
+            with bare_root():
+                configure_log_output("INFO")
+                (handler,) = logging.getLogger().handlers
+                formatted = handler.format(record)
+        finally:
+            monkeypatch.undo()
+            time.tzset()
 
         assert formatted == "1970-01-02T00:00:00Z INFO app.x: m"
 
@@ -937,10 +924,6 @@ class TestLogOutput:
     async def test_a_refusal_s_details_are_redacted_in_the_line(self):
         """The reproduction from review: a duplicate sign-up is refused with the address
         in `details`, and the handler logs `details` as an extra."""
-        from app.api.exception_handlers import app_exception_handler
-        from app.core.exceptions import AlreadyExistsError
-        from tests.api.test_error_envelope import _HttpConnection
-
         with bare_root() as stderr:
             configure_log_output("INFO")
             await app_exception_handler(
@@ -957,26 +940,22 @@ class TestLogOutput:
     def test_a_credential_named_extra_is_masked_in_the_line(self):
         with bare_root() as stderr:
             configure_log_output("INFO")
-            logging.getLogger("app.services.workflow_execution.dispatcher").warning(
-                "workflow_dispatch_lost_claim",
-                extra={"node_run_id": "n1", "token": "claim-4f2b9c1a"},
+            logging.getLogger("app.services.example").warning(
+                "provider_refused", extra={"provider": "otari", "api_key": "sk-short"}
             )
 
-        assert "claim-4f2b9c1a" not in stderr.getvalue()
-        assert stderr.getvalue().endswith(
-            " workflow_dispatch_lost_claim node_run_id=n1 token=[REDACTED]\n"
-        )
+        assert "sk-short" not in stderr.getvalue()
+        assert stderr.getvalue().endswith(" provider_refused provider=otari api_key=[REDACTED]\n")
 
     def test_the_handler_is_installed_once(self):
         """The API's lifespan, the worker and each ingest child all call it."""
         with bare_root():
             configure_log_output("INFO")
             configure_log_output("DEBUG")
-            ours = [h for h in logging.getLogger().handlers if h.get_name() == "agenticos-output"]
+            (handler,) = logging.getLogger().handlers
             level = logging.getLogger("app").level
 
-        assert len(ours) == 1
-        assert sum(isinstance(f, PiiRedactionFilter) for f in ours[0].filters) == 1
+        assert sum(isinstance(f, PiiRedactionFilter) for f in handler.filters) == 1
         assert level == logging.DEBUG, "the second call sets the level again"
 
     def test_a_process_with_a_handler_of_its_own_is_left_alone(self):

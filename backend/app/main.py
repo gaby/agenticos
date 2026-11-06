@@ -246,8 +246,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[LifespanState]:
     # correct but pays a connect per request (#1079).
     claim_pooled_engines()
     watchdog = EventLoopWatchdog(wedged_after=settings.EVENT_LOOP_WEDGED_AFTER)
-    # Here and not in `create_app`: the CLI and the worker import this module too,
-    # and only the process that serves has its log read with `docker compose logs`.
+    # Here and not in `create_app`: the CLI and the worker import this module too, and
+    # importing it must not install a handler.
     configure_log_output(settings.LOG_LEVEL)
     # Again, now that the server has configured its own loggers: uvicorn's access
     # log has a handler of its own, and in some launch modes it is created after

@@ -29,19 +29,29 @@ class TestDefaultOrgBudget:
 
 
 class TestLogLevel:
-    def test_info_is_the_default(self):
-        assert Settings().LOG_LEVEL == "INFO"
+    def test_info_is_the_default(self, monkeypatch):
+        """Without the environment: a developer's `LOG_LEVEL` is not the default."""
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
 
-    @pytest.mark.parametrize("written", ["debug", "Warning", " error ", "CRITICAL"])
-    def test_a_level_is_accepted_in_any_case(self, written):
-        """`LOG_LEVEL=info` is how most people write it; refusing it would stop the API
-        from starting over a capital letter."""
-        assert written.strip().upper() == Settings(LOG_LEVEL=written).LOG_LEVEL
+        assert Settings(_env_file=None).LOG_LEVEL == "INFO"
 
-    @pytest.mark.parametrize(("written", "expected"), [("warn", "WARNING"), ("FATAL", "CRITICAL")])
-    def test_the_two_aliases_logging_accepts_are_accepted(self, written, expected):
-        """`WARN` is how most other stacks spell it; refusing it stops the API from
-        starting over a spelling `logging.getLevelName` itself understands."""
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            ("debug", "DEBUG"),
+            ("Warning", "WARNING"),
+            (" error ", "ERROR"),
+            ("CRITICAL", "CRITICAL"),
+            ("warn", "WARNING"),
+            ("FATAL", "CRITICAL"),
+        ],
+    )
+    def test_a_level_is_accepted_in_any_case_and_under_the_aliases_logging_accepts(
+        self, written, expected
+    ):
+        """`LOG_LEVEL=info` is how most people write it and `WARN` how most other stacks
+        do; refusing either stops the API from starting over a spelling `logging`
+        itself understands."""
         assert expected == Settings(LOG_LEVEL=written).LOG_LEVEL
 
     @pytest.mark.parametrize("bad", ["verbose", "", "10", 20])

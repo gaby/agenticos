@@ -28,8 +28,16 @@ _STANDARD_RECORD_KEYS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None
     "asctime",
 }
 
-#: What a secret path segment is written as, wherever an address is recorded.
+#: What a secret is written as in a log line: a path segment, a query value, or a
+#: field named like a credential.
 SECRET_PATH_MARKER = "[REDACTED]"
+
+#: The words that give a value away when a message names them, as in `password=...`.
+#: The key=value pattern below redacts what follows one and `_CREDENTIAL_KEY` masks a
+#: field called one, so a field is masked by name for every word the text rule knows.
+_CREDENTIAL_WORDS = (
+    "password|passwd|pwd|secret_key|api_key|apikey|auth_token|access_token|refresh_token"
+)
 
 #: A field name that holds a credential, whatever its value looks like.
 #:
@@ -38,12 +46,12 @@ SECRET_PATH_MARKER = "[REDACTED]"
 #: `{"token": "..."}` has neither, and the name is the evidence. It names the
 #: credential itself - `token`, `claim_token`, `api_key`, `secret` - and not what
 #: only mentions one: `secret_id`, `max_tokens` and `established_tokens` are ids and
-#: counts, and masking them would hide what the line was written to say.
+#: counts, and masking them would hide what the line was written to say. Top-level
+#: fields only: a credential inside a dict is left to the patterns.
 _CREDENTIAL_KEY = re.compile(
-    r"(?:.*_)?(?:token|secret|password|passwd|pwd|api_?key|authorization|cookie|credentials?)",
+    rf"(?:.*_)?(?:{_CREDENTIAL_WORDS}|token|secret|authorization|cookie|credentials?)",
     re.IGNORECASE,
 )
-_CREDENTIAL_MASK = "[REDACTED]"
 
 #: The addresses whose next segment is itself the credential.
 #:
@@ -210,8 +218,7 @@ class PiiRedactionFilter(logging.Filter):
         # Password/secret in key=value or key: value patterns
         (
             re.compile(
-                r"(password|passwd|pwd|secret_key|api_key|apikey|auth_token|access_token|refresh_token)"
-                r"[\s]*[=:]\s*['\"]?\S+['\"]?",
+                rf"({_CREDENTIAL_WORDS})[\s]*[=:]\s*['\"]?\S+['\"]?",
                 re.IGNORECASE,
             ),
             r"\1=[REDACTED]",
@@ -245,7 +252,7 @@ class PiiRedactionFilter(logging.Filter):
             if key in _STANDARD_RECORD_KEYS:
                 continue
             record.__dict__[key] = (
-                _CREDENTIAL_MASK if _CREDENTIAL_KEY.fullmatch(key) else self._redact_extra(value)
+                SECRET_PATH_MARKER if _CREDENTIAL_KEY.fullmatch(key) else self._redact_arg(value)
             )
         return True
 
@@ -255,36 +262,30 @@ class PiiRedactionFilter(logging.Filter):
         return _escape_line_breakers(value)
 
     def _redact_arg(self, value: object) -> object:
-        """A format argument, redacted the way it will be rendered.
+        """A format argument or an `extra=` field, redacted the way it will be rendered.
 
         A string is redacted directly. Anything else that isn't a plain number or
         flag - an `httpx.URL`, a Starlette `URL`, an exception - is rendered by `%s`
         through `str()`, so that text is what is checked; the object is replaced by
         its redacted text only when redacting changed it, so a `%d` or `%r` of an
         ordinary argument still formats as it did.
+
+        An object that cannot be rendered - a row whose `__repr__` reads an expired
+        attribute - becomes a placeholder naming what failed. A filter runs in the
+        caller's frame, outside the `try` in `Handler.emit` that hands a formatting
+        error to `handleError`, so raising here would take the caller down with a log
+        call.
         """
         if isinstance(value, str):
             return self._redact(value)
         if value is None or isinstance(value, (bool, int, float)):
             return value
-        rendered = str(value)
+        try:
+            rendered = str(value)
+        except Exception as error:
+            return f"<{type(value).__name__}: {type(error).__name__} while printing>"
         redacted = self._redact(rendered)
         return value if redacted == rendered else redacted
-
-    def _redact_extra(self, value: object) -> object:
-        """A field passed through `extra=`, redacted the way a formatter will render it.
-
-        What `_redact_arg` does for a format argument, with one more case. A filter
-        runs in the caller's frame, so an object that cannot be rendered - a row whose
-        `__repr__` reads an expired attribute - would raise out of `logger.info` and
-        not out of the handler, where the standard library catches it
-        (`Handler.handleError`). The field is replaced by its type instead, because a
-        log call must not take its caller down.
-        """
-        try:
-            return self._redact_arg(value)
-        except Exception:
-            return f"<{type(value).__name__}: could not be printed>"
 
 
 @overload
@@ -424,12 +425,12 @@ def configure_log_output(level: str) -> None:
         level: A level name `logging` accepts, such as `"INFO"`.
     """
     root = logging.getLogger()
-    if not any(handler.get_name() == _OUTPUT_HANDLER_NAME for handler in root.handlers):
-        if root.handlers:
-            return
+    if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.set_name(_OUTPUT_HANDLER_NAME)
         handler.setFormatter(_OutputFormatter(_OUTPUT_FORMAT, datefmt=_OUTPUT_DATE_FORMAT))
         _add_redaction(handler)
         root.addHandler(handler)
+    elif not any(existing.get_name() == _OUTPUT_HANDLER_NAME for existing in root.handlers):
+        return  # somebody else's logging
     logging.getLogger("app").setLevel(level)

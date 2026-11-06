@@ -883,7 +883,7 @@ async def begin_attempt(
         # worker's to touch, let alone close.
         logger.warning(
             "workflow_dispatch_lost_claim",
-            extra={"node_run_id": str(node_run_id), "token": str(token)},
+            extra={"node_run_id": str(node_run_id), "claim_id": str(token)},
         )
         return None
     if outbox.status != DispatchOutboxStatus.CLAIMED.value:
