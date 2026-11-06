@@ -143,6 +143,60 @@ def test_a_container_passed_through_extra_is_redacted_as_it_renders():
     )
 
 
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "name",
+    [
+        "password",
+        "PASSWORD",
+        "api_key",
+        "apikey",
+        "token",
+        "claim_token",
+        "access_token",
+        "secret",
+        "client_secret",
+        "authorization",
+        "cookie",
+        "credentials",
+    ],
+)
+def test_a_field_named_like_a_credential_is_masked_whatever_its_value_looks_like(name):
+    """The patterns know a secret by its shape, or by the key written beside it in a
+    message. A field passed through `extra=` arrives without its key, so a short
+    `token` had neither - and `workflow_dispatch_lost_claim` logs its fencing token
+    exactly that way."""
+    record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "m", None, None)
+    setattr(record, name, "hunter2")
+
+    PiiRedactionFilter().filter(record)
+
+    assert getattr(record, name) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "established_tokens",
+        "max_tokens",
+        "token_count",
+        "tokens",
+        "secret_id",
+        "secret_kind",
+        "key",
+    ],
+)
+def test_a_field_that_only_mentions_a_credential_is_left_alone(name):
+    """Counts and ids are what these names are for, and masking them would hide the
+    one thing the log line was written to say."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+    setattr(record, name, "7")
+
+    PiiRedactionFilter().filter(record)
+
+    assert getattr(record, name) == "7"
+
+
 def test_an_extra_that_needs_no_redaction_keeps_its_type():
     """A JSON formatter wants the dict as a dict and the id as an id."""
     record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
@@ -898,6 +952,20 @@ class TestLogOutput:
 
         assert "alice@example.com" not in stderr.getvalue()
         assert "details={'email': '[EMAIL_REDACTED]'}" in stderr.getvalue()
+
+    @pytest.mark.security
+    def test_a_credential_named_extra_is_masked_in_the_line(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.workflow_execution.dispatcher").warning(
+                "workflow_dispatch_lost_claim",
+                extra={"node_run_id": "n1", "token": "claim-4f2b9c1a"},
+            )
+
+        assert "claim-4f2b9c1a" not in stderr.getvalue()
+        assert stderr.getvalue().endswith(
+            " workflow_dispatch_lost_claim node_run_id=n1 token=[REDACTED]\n"
+        )
 
     def test_the_handler_is_installed_once(self):
         """The API's lifespan, the worker and each ingest child all call it."""

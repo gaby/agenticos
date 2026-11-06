@@ -31,6 +31,20 @@ _STANDARD_RECORD_KEYS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None
 #: What a secret path segment is written as, wherever an address is recorded.
 SECRET_PATH_MARKER = "[REDACTED]"
 
+#: A field name that holds a credential, whatever its value looks like.
+#:
+#: The patterns below know a secret by its shape, or by the key written beside it in
+#: a message. A field passed through `extra=` arrives without its key, so a short
+#: `{"token": "..."}` has neither, and the name is the evidence. It names the
+#: credential itself - `token`, `claim_token`, `api_key`, `secret` - and not what
+#: only mentions one: `secret_id`, `max_tokens` and `established_tokens` are ids and
+#: counts, and masking them would hide what the line was written to say.
+_CREDENTIAL_KEY = re.compile(
+    r"(?:.*_)?(?:token|secret|password|passwd|pwd|api_?key|authorization|cookie|credentials?)",
+    re.IGNORECASE,
+)
+_CREDENTIAL_MASK = "[REDACTED]"
+
 #: The addresses whose next segment is itself the credential.
 #:
 #: Each opens something to whoever reads the line, with no account or with only
@@ -156,7 +170,9 @@ class PiiRedactionFilter(logging.Filter):
     a refusal logs holds the address somebody submitted. The stock formatter
     prints none of them; the one `configure_log_output` installs does, and so
     would a JSON or key-value formatter, the ordinary production choice. Neither
-    may acquire a hole by being what renders them.
+    may acquire a hole by being what renders them. A field named like a credential
+    (`token`, `api_key`, ...) is masked outright: its value arrives without the key
+    the patterns need to recognise it.
 
     Usage:
         logging.getLogger().addFilter(PiiRedactionFilter())
@@ -226,8 +242,11 @@ class PiiRedactionFilter(logging.Filter):
         # Anything a call site added through `extra=`, which arrives as an
         # attribute on the record rather than in `msg` or `args`.
         for key, value in record.__dict__.items():
-            if key not in _STANDARD_RECORD_KEYS:
-                record.__dict__[key] = self._redact_extra(value)
+            if key in _STANDARD_RECORD_KEYS:
+                continue
+            record.__dict__[key] = (
+                _CREDENTIAL_MASK if _CREDENTIAL_KEY.fullmatch(key) else self._redact_extra(value)
+            )
         return True
 
     def _redact(self, value: str) -> str:

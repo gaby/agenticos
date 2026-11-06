@@ -38,6 +38,12 @@ class TestLogLevel:
         from starting over a capital letter."""
         assert written.strip().upper() == Settings(LOG_LEVEL=written).LOG_LEVEL
 
+    @pytest.mark.parametrize(("written", "expected"), [("warn", "WARNING"), ("FATAL", "CRITICAL")])
+    def test_the_two_aliases_logging_accepts_are_accepted(self, written, expected):
+        """`WARN` is how most other stacks spell it; refusing it stops the API from
+        starting over a spelling `logging.getLevelName` itself understands."""
+        assert expected == Settings(LOG_LEVEL=written).LOG_LEVEL
+
     @pytest.mark.parametrize("bad", ["verbose", "", "10", 20])
     def test_anything_that_is_not_a_level_is_refused(self, bad):
         with pytest.raises(ValidationError):

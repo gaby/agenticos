@@ -112,8 +112,12 @@ class Settings(BaseSettings):
 
     @field_validator("LOG_LEVEL", mode="before")
     @classmethod
-    def log_level_in_any_case(cls, value: object) -> object:
-        return value.strip().upper() if isinstance(value, str) else value
+    def log_level_name(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        level = value.strip().upper()
+        # The two other names `logging.getLevelName` understands.
+        return {"WARN": "WARNING", "FATAL": "CRITICAL"}.get(level, level)
 
     ENVIRONMENT: Literal["development", "local", "staging", "production"] = "local"
     TIMEZONE: str = "UTC"  # IANA timezone (e.g. "UTC", "Europe/Warsaw", "America/New_York")
