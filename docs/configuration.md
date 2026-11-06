@@ -44,6 +44,7 @@ The config refuses an unset `VAULT_MASTER_KEY` outside `local`/`development`.
 | `API_V1_STR` | `/api/v1` | API version prefix |
 | `DEBUG` | `false` | Enable debug mode (verbose errors, auto-reload) |
 | `ENVIRONMENT` | `local` | One of: `development`, `local`, `staging`, `production` |
+| `LOG_LEVEL` | `INFO` | How much of the application's own log is printed: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, in any case. Libraries stay at `WARNING`. See [Logs](#logs) |
 | `TIMEZONE` | `UTC` | IANA timezone (e.g. `UTC`, `Europe/Warsaw`, `America/New_York`) |
 | `MODELS_CACHE_DIR` | `./models_cache` | Directory for cached ML models |
 | `MEDIA_DIR` | `./media` | Directory for uploaded files |
@@ -612,6 +613,33 @@ general assistant; setting them now does nothing.
 
 The one model credential that stays in the environment is the embeddings key —
 see RAG below.
+
+## Logs
+
+The `app` and `worker` containers write their log to standard error, which is what
+`docker compose logs app worker` shows. A line starts with the time in UTC, the level
+and the name of the logger. A failure puts its cause on the traceback line that
+follows it:
+
+```text
+2026-11-06T12:34:56Z WARNING app.services.model_catalog: Could not list models for otari; and there is no curated list to fall back to
+Traceback (most recent call last):\n  File "...", line 539, in _listed\n ...\nhttpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
+```
+
+A call that passes fields has them appended to the message as `key=value`. A traceback
+is one line, with its line breaks written as `\n`, so a value somebody submitted cannot
+start an entry of its own. Email addresses, tokens, API keys and signed links are
+redacted before a line is written.
+
+`LOG_LEVEL` sets how much of the application's own log is printed, `INFO` by default;
+`WARNING` prints only what went wrong. Libraries stay at `WARNING` whatever it says,
+because at `INFO` httpx writes every URL it requests, query string included. If you
+start the API with your own `--log-config`, or anything else puts a handler on the
+root logger, `LOG_LEVEL` has no effect and the log is yours to configure.
+
+Outside `ENVIRONMENT=production`, Logfire also prints a line for every span, about forty
+per request, and they bury the entries above. Set `LOGFIRE_CONSOLE=false` to switch them
+off; production already does. See [Observability](#observability-logfire).
 
 ## Observability (Logfire)
 

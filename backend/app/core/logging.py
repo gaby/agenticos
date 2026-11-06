@@ -1,7 +1,9 @@
-"""Logging utilities - the filter every handler carries: PII, and forged lines."""
+"""Logging utilities: the filter every handler carries (PII, forged lines), and where the log is printed."""
 
 import logging
 import re
+import sys
+import time
 from typing import ClassVar, overload
 
 #: Bytes that end a log line, or move a terminal reading one.
@@ -26,8 +28,30 @@ _STANDARD_RECORD_KEYS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None
     "asctime",
 }
 
-#: What a secret path segment is written as, wherever an address is recorded.
+#: What a secret is written as in a log line: a path segment, a query value, or a
+#: field named like a credential.
 SECRET_PATH_MARKER = "[REDACTED]"
+
+#: The words that give a value away when a message names them, as in `password=...`.
+#: The key=value pattern below redacts what follows one and `_CREDENTIAL_KEY` masks a
+#: field called one, so a field is masked by name for every word the text rule knows.
+_CREDENTIAL_WORDS = (
+    "password|passwd|pwd|secret_key|api_key|apikey|auth_token|access_token|refresh_token"
+)
+
+#: A field name that holds a credential, whatever its value looks like.
+#:
+#: The patterns below know a secret by its shape, or by the key written beside it in
+#: a message. A field passed through `extra=` arrives without its key, so a short
+#: `{"token": "..."}` has neither, and the name is the evidence. It names the
+#: credential itself - `token`, `claim_token`, `api_key`, `secret` - and not what
+#: only mentions one: `secret_id`, `max_tokens` and `established_tokens` are ids and
+#: counts, and masking them would hide what the line was written to say. Top-level
+#: fields only: a credential inside a dict is left to the patterns.
+_CREDENTIAL_KEY = re.compile(
+    rf"(?:.*_)?(?:{_CREDENTIAL_WORDS}|token|secret|authorization|cookie|credentials?)",
+    re.IGNORECASE,
+)
 
 #: The addresses whose next segment is itself the credential.
 #:
@@ -149,10 +173,14 @@ class PiiRedactionFilter(logging.Filter):
     forget it, and the alternative - sanitising at each of the dozen places a
     request value reaches a log - is the copy that ends up weaker.
 
-    Values passed through `extra=` are escaped too. The default formatter does
-    not render them, so they cannot forge a line today; a deployment that plugs
-    in one that does - a JSON or key-value formatter, which is the ordinary
-    production choice - must not acquire the hole by changing its formatter.
+    Values passed through `extra=` are redacted and escaped too, whatever their
+    type: a string directly, anything else as it will render - the `details` dict
+    a refusal logs holds the address somebody submitted. The stock formatter
+    prints none of them; the one `configure_log_output` installs does, and so
+    would a JSON or key-value formatter, the ordinary production choice. Neither
+    may acquire a hole by being what renders them. A field named like a credential
+    (`token`, `api_key`, ...) is masked outright: its value arrives without the key
+    the patterns need to recognise it.
 
     Usage:
         logging.getLogger().addFilter(PiiRedactionFilter())
@@ -190,8 +218,7 @@ class PiiRedactionFilter(logging.Filter):
         # Password/secret in key=value or key: value patterns
         (
             re.compile(
-                r"(password|passwd|pwd|secret_key|api_key|apikey|auth_token|access_token|refresh_token)"
-                r"[\s]*[=:]\s*['\"]?\S+['\"]?",
+                rf"({_CREDENTIAL_WORDS})[\s]*[=:]\s*['\"]?\S+['\"]?",
                 re.IGNORECASE,
             ),
             r"\1=[REDACTED]",
@@ -222,8 +249,11 @@ class PiiRedactionFilter(logging.Filter):
         # Anything a call site added through `extra=`, which arrives as an
         # attribute on the record rather than in `msg` or `args`.
         for key, value in record.__dict__.items():
-            if key not in _STANDARD_RECORD_KEYS and isinstance(value, str):
-                record.__dict__[key] = self._redact(value)
+            if key in _STANDARD_RECORD_KEYS:
+                continue
+            record.__dict__[key] = (
+                SECRET_PATH_MARKER if _CREDENTIAL_KEY.fullmatch(key) else self._redact_arg(value)
+            )
         return True
 
     def _redact(self, value: str) -> str:
@@ -232,19 +262,28 @@ class PiiRedactionFilter(logging.Filter):
         return _escape_line_breakers(value)
 
     def _redact_arg(self, value: object) -> object:
-        """A format argument, redacted the way it will be rendered.
+        """A format argument or an `extra=` field, redacted the way it will be rendered.
 
         A string is redacted directly. Anything else that isn't a plain number or
         flag - an `httpx.URL`, a Starlette `URL`, an exception - is rendered by `%s`
         through `str()`, so that text is what is checked; the object is replaced by
         its redacted text only when redacting changed it, so a `%d` or `%r` of an
         ordinary argument still formats as it did.
+
+        An object that cannot be rendered - a row whose `__repr__` reads an expired
+        attribute - becomes a placeholder naming what failed. A filter runs in the
+        caller's frame, outside the `try` in `Handler.emit` that hands a formatting
+        error to `handleError`, so raising here would take the caller down with a log
+        call.
         """
         if isinstance(value, str):
             return self._redact(value)
         if value is None or isinstance(value, (bool, int, float)):
             return value
-        rendered = str(value)
+        try:
+            rendered = str(value)
+        except Exception as error:
+            return f"<{type(value).__name__}: {type(error).__name__} while printing>"
         redacted = self._redact(rendered)
         return value if redacted == rendered else redacted
 
@@ -333,3 +372,65 @@ def _add_redaction(filterer: logging.Filterer) -> None:
     """Put one redaction filter on a logger or a handler, unless it has one."""
     if not any(isinstance(f, PiiRedactionFilter) for f in filterer.filters):
         filterer.addFilter(PiiRedactionFilter())
+
+
+_OUTPUT_HANDLER_NAME = "agenticos-output"
+"""What `configure_log_output` calls its handler, so a second call finds it."""
+
+_OUTPUT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_OUTPUT_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+class _OutputFormatter(logging.Formatter):
+    """`time LEVEL logger: message key=value ...`, with the time in UTC.
+
+    The pairs are what the call passed as `extra=`. This code base logs an event name
+    and keeps the detail there - `logger.exception("voice_call_failed",
+    extra={"call_id": ...})` - and the stock formatter prints none of it, so the line
+    said that something failed and not which call.
+    """
+
+    converter = time.gmtime
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        message = super().formatMessage(record)
+        # Redacted and escaped already: `configure_log_output` puts `PiiRedactionFilter`
+        # on the handler this formatter belongs to, and it covers every type.
+        fields = [
+            f"{key}={value}"
+            for key, value in record.__dict__.items()
+            if key not in _STANDARD_RECORD_KEYS
+        ]
+        return " ".join([message, *fields])
+
+
+def configure_log_output(level: str) -> None:
+    """Print this application's log to stderr, readably, in a process with no handler of its own.
+
+    Nothing in the application installs a root handler and uvicorn configures only
+    its own loggers, so under `uvicorn app.main:app` Python's last-resort handler was
+    all there was: it printed what reached WARNING as a bare message, with no time,
+    level or logger name, and dropped everything below. An `INFO` line, such as an
+    agent turn being refused, was never printed.
+
+    `level` is the threshold for the `app` loggers only. Libraries stay at the root's
+    WARNING: at `INFO` httpx writes every URL it requests, query string included, and
+    scrubbing a library's lines is not something this module can promise.
+
+    A process that already has a root handler - an operator's `--log-config`, a test
+    runner's capture - keeps its own logging, as with `logging.basicConfig`. Calling
+    this again is safe: the handler is found by name and only the level is set again.
+
+    Args:
+        level: A level name `logging` accepts, such as `"INFO"`.
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.set_name(_OUTPUT_HANDLER_NAME)
+        handler.setFormatter(_OutputFormatter(_OUTPUT_FORMAT, datefmt=_OUTPUT_DATE_FORMAT))
+        _add_redaction(handler)
+        root.addHandler(handler)
+    elif not any(existing.get_name() == _OUTPUT_HANDLER_NAME for existing in root.handlers):
+        return  # somebody else's logging
+    logging.getLogger("app").setLevel(level)

@@ -88,7 +88,7 @@ def test_the_ingest_handlers_are_exactly_the_ingest_pools_kinds() -> None:
     assert set(handlers.ingest()) <= set(handlers.production())
 
 
-def test_main_sets_redaction_and_tracing_up_before_it_serves() -> None:
+def test_main_sets_logging_and_tracing_up_before_it_serves() -> None:
     order: list[str] = []
 
     def served(coroutine: Coroutine[object, object, None]) -> None:
@@ -96,6 +96,11 @@ def test_main_sets_redaction_and_tracing_up_before_it_serves() -> None:
         coroutine.close()
 
     with (
+        patch.object(
+            worker_main,
+            "configure_log_output",
+            side_effect=lambda level: order.append(f"output:{level}"),
+        ),
         patch.object(worker_main, "setup_logging", side_effect=lambda: order.append("logging")),
         patch.object(
             worker_main, "setup_worker_observability", side_effect=lambda: order.append("tracing")
@@ -105,7 +110,7 @@ def test_main_sets_redaction_and_tracing_up_before_it_serves() -> None:
     ):
         worker_main.main()
 
-    assert order == ["logging", "tracing", "serve"]
+    assert order == [f"output:{worker_main.settings.LOG_LEVEL}", "logging", "tracing", "serve"]
 
 
 async def test_serve_connects_what_a_fired_run_publishes_on_and_declares_the_schedules() -> None:

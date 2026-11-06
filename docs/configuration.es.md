@@ -1,5 +1,5 @@
 ---
-source_sha: "81e337178b21"
+source_sha: "8f1abc47bca1"
 ---
 
 # Configuración { #configuration }
@@ -50,6 +50,7 @@ La configuración rechaza un `VAULT_MASTER_KEY` sin fijar fuera de
 | `API_V1_STR` | `/api/v1` | Prefijo de la versión de la API |
 | `DEBUG` | `false` | Activa el modo de depuración (errores detallados, recarga automática) |
 | `ENVIRONMENT` | `local` | Uno de: `development`, `local`, `staging`, `production` |
+| `LOG_LEVEL` | `INFO` | Cuánto del log propio de la aplicación se imprime: `DEBUG`, `INFO`, `WARNING`, `ERROR` o `CRITICAL`, en mayúsculas o minúsculas. Las bibliotecas se quedan en `WARNING`. Ver [Logs](#logs) |
 | `TIMEZONE` | `UTC` | Zona horaria IANA (p. ej. `UTC`, `Europe/Warsaw`, `America/New_York`) |
 | `MODELS_CACHE_DIR` | `./models_cache` | Directorio para los modelos de ML cacheados |
 | `MEDIA_DIR` | `./media` | Directorio para los archivos subidos |
@@ -639,6 +640,35 @@ ahora no hace nada.
 
 La única credencial de modelo que se queda en el entorno es la de embeddings — ver
 RAG más abajo.
+
+## Logs { #logs }
+
+Los contenedores `app` y `worker` escriben su log en la salida de error estándar, que
+es lo que muestra `docker compose logs app worker`. Una línea empieza con la hora en
+UTC, el nivel y el nombre del logger. Un fallo pone su causa en la línea del traceback
+que le sigue:
+
+```text
+2026-11-06T12:34:56Z WARNING app.services.model_catalog: Could not list models for otari; and there is no curated list to fall back to
+Traceback (most recent call last):\n  File "...", line 539, in _listed\n ...\nhttpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
+```
+
+A una llamada que pasa campos se le añaden al mensaje como `key=value`. Un traceback
+es una sola línea, con sus saltos de línea escritos como `\n`, de modo que un valor
+enviado por alguien no puede iniciar una entrada propia. Las direcciones de correo, los
+tokens, las claves de API y los enlaces firmados se redactan antes de escribir la línea.
+
+`LOG_LEVEL` fija cuánto del log propio de la aplicación se imprime, `INFO` por defecto;
+`WARNING` imprime solo lo que salió mal. Las bibliotecas se quedan en `WARNING` diga lo
+que diga, porque con `INFO` httpx escribe cada URL que solicita, query string incluida.
+Si el operador arranca la API con su propio `--log-config`, o cualquier otra cosa pone
+un handler en el logger raíz, `LOG_LEVEL` no tiene efecto y el log queda a cargo del
+operador.
+
+Fuera de `ENVIRONMENT=production`, Logfire también imprime una línea por cada span,
+unas cuarenta por petición, y entierran las entradas de arriba. Con
+`LOGFIRE_CONSOLE=false` se apagan; producción ya las tiene apagadas. Ver
+[Observabilidad](#observability-logfire).
 
 ## Observabilidad (Logfire) { #observability-logfire }
 

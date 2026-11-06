@@ -9,13 +9,20 @@ unconfigured process is still covered, and the two entrypoints that were missing
 the call now make it.
 """
 
+import ast
 import copy
 import io
 import logging
 import logging.config
+import re
 import secrets
+import sys
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
+from typing import NoReturn
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -26,14 +33,18 @@ from starlette.datastructures import URL
 from uvicorn.config import LOGGING_CONFIG
 from uvicorn.logging import DefaultFormatter
 
+from app.api.exception_handlers import app_exception_handler
+from app.core.exceptions import AlreadyExistsError
 from app.core.logging import (
     SECRET_PATH_MARKER,
     PiiRedactionFilter,
+    configure_log_output,
     one_line,
     redact_secret_paths,
     setup_logging,
 )
 from app.core.security import create_artifact_view_token
+from tests.api.test_error_envelope import _HttpConnection
 
 # Built from fragments on purpose: the test proves the filter strips a credential
 # at runtime, so a static secret-scanner must not read a literal one flowing into
@@ -109,9 +120,8 @@ def test_a_submitted_value_cannot_write_a_log_entry_of_its_own(root_stream):
 
 @pytest.mark.security
 def test_a_value_passed_through_extra_is_escaped_too(root_stream):
-    """The default formatter does not render `extra`, so this forges nothing
-    today - but a deployment that plugs in a JSON or key-value formatter, which is
-    the ordinary production choice, must not acquire the hole by doing so."""
+    """A formatter that renders `extra` - the one `configure_log_output` installs, or
+    a JSON or key-value one - must not let a value forge a line by being what prints it."""
     setup_logging()
     record = logging.LogRecord("app.x", logging.WARNING, "p", 1, "embed_origin_refused", None, None)
     record.origin = "https://evil.example\r\n2026-01-01 FORGED"
@@ -119,6 +129,134 @@ def test_a_value_passed_through_extra_is_escaped_too(root_stream):
     PiiRedactionFilter().filter(record)
 
     assert record.origin == "https://evil.example\\r\\n2026-01-01 FORGED"
+
+
+def _filtered(**extra: object) -> logging.LogRecord:
+    """A record carrying these `extra=` fields, after the filter has been over it."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+    record.__dict__.update(extra)
+    PiiRedactionFilter().filter(record)
+    return record
+
+
+class _Detached:
+    """An object whose `str()` raises, like a row whose attribute expired."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("instance is not bound to a Session")
+
+
+@pytest.mark.security
+def test_a_container_passed_through_extra_is_redacted_as_it_renders():
+    """The filter scrubbed a string extra and left a dict alone, which was safe while
+    nothing printed an extra. `app_exception_handler` logs `details`, a dict, and a
+    service puts the address somebody submitted in it."""
+    record = _filtered(details={"email": "alice@example.com", "attempts": 3, "key": _SAMPLE_VALUE})
+
+    assert (
+        record.details
+        == "{'email': '[EMAIL_REDACTED]', 'attempts': 3, 'key': '[API_KEY_REDACTED]'}"
+    )
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "name",
+    [
+        "password",
+        "PASSWORD",
+        "api_key",
+        "apikey",
+        "secret_key",
+        "token",
+        "claim_token",
+        "access_token",
+        "secret",
+        "client_secret",
+        "authorization",
+        "cookie",
+        "credentials",
+    ],
+)
+def test_a_field_named_like_a_credential_is_masked_whatever_its_value_looks_like(name):
+    """The patterns know a secret by its shape, or by the key written beside it in a
+    message. A field passed through `extra=` arrives without its key, so a short
+    `token` had neither."""
+    assert getattr(_filtered(**{name: "hunter2"}), name) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "established_tokens",
+        "max_tokens",
+        "token_count",
+        "tokens",
+        "secret_id",
+        "secret_kind",
+        "key",
+    ],
+)
+def test_a_field_that_only_mentions_a_credential_is_left_alone(name):
+    """Counts and ids are what these names are for, and masking them would hide the
+    one thing the log line was written to say."""
+    assert getattr(_filtered(**{name: "7"}), name) == "7"
+
+
+def test_an_extra_that_needs_no_redaction_keeps_its_type():
+    """A JSON formatter wants the dict as a dict and the id as an id."""
+    ident, counts = uuid4(), {"attempts": 3}
+
+    record = _filtered(call_id=ident, counts=counts, n=3, flag=True, nothing=None)
+
+    assert record.call_id is ident
+    assert record.counts is counts
+    assert (record.n, record.flag, record.nothing) == (3, True, None)
+
+
+def test_an_extra_that_cannot_be_printed_does_not_break_the_logging_call():
+    """A filter runs in the caller's frame, so an object whose `str()` raises would
+    surface from `logger.info` and not from the handler, where the standard library
+    catches it."""
+    assert _filtered(row=_Detached()).row == "<_Detached: RuntimeError while printing>"
+
+
+@pytest.mark.parametrize(
+    ("msg", "args"),
+    [("x %s", (_Detached(),)), ("x %(r)s", ({"r": _Detached()},))],
+    ids=["positional", "named"],
+)
+def test_a_format_argument_that_cannot_be_printed_does_not_break_the_logging_call(msg, args):
+    """The same guard on the path that was there before extras: `logger.info("x %s", row)`
+    raised out of the filter too."""
+    record = logging.LogRecord("app.x", logging.INFO, "p", 1, msg, args, None)
+
+    PiiRedactionFilter().filter(record)
+
+    assert record.getMessage() == "x <_Detached: RuntimeError while printing>"
+
+
+def test_a_module_run_as_main_does_not_name_its_logger_after_itself():
+    """`python -m app.worker` runs with `__name__ == "__main__"`, so `getLogger(__name__)`
+    there is a logger called `__main__`: outside the `app` tree `LOG_LEVEL` governs, so
+    its INFO lines are dropped and its errors print whatever the level is."""
+    offenders: list[str] = []
+    for source in sorted((Path(__file__).resolve().parents[1] / "app").rglob("*.py")):
+        text = source.read_text()
+        # Only a module that can run as a script has a `__main__` name to be wrong about.
+        # Reading every module is cheap; parsing all of them was two seconds.
+        if source.name != "__main__.py" and "if __name__" not in text:
+            continue
+        offenders += [
+            f"{source.name}:{node.lineno}"
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "getLogger"
+            and [getattr(arg, "id", None) for arg in node.args] == ["__name__"]
+        ]
+
+    assert offenders == [], "name the logger 'app.<package>.<module>' explicitly"
 
 
 @pytest.mark.security
@@ -625,3 +763,226 @@ def test_signed_discord_download_queries_do_not_escape_through_exception_logs(
     assert "query-signature" not in emitted
     assert redact_secret_paths(url) == path + "?[REDACTED]"
     assert redact_secret_paths(path + "?[REDACTED]") == path + "?[REDACTED]"
+
+
+@contextmanager
+def bare_root() -> Iterator[io.StringIO]:
+    """The root logger as `uvicorn app.main:app` leaves it - no handler - and stderr captured.
+
+    A context manager and not a fixture: pytest puts its capture handlers on the root
+    again at the start of each phase, so a fixture's bare root is gone by the time the
+    test body runs. Handlers and levels are put back on the way out, so nothing
+    `configure_log_output` installs outlives the test.
+    """
+    root, application = logging.getLogger(), logging.getLogger("app")
+    handlers, root_level, application_level = list(root.handlers), root.level, application.level
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    application.setLevel(logging.NOTSET)
+    stream = io.StringIO()
+    try:
+        with patch.object(sys, "stderr", stream):
+            yield stream
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(root_level)
+        application.setLevel(application_level)
+
+
+def _fail_with(error: Exception) -> NoReturn:
+    raise error
+
+
+class TestLogOutput:
+    """Where the application's own log goes in a process that configured nothing.
+
+    Under `uvicorn app.main:app` that was Python's last-resort handler: WARNING and above,
+    as a bare message, and everything below it dropped. So an `INFO` line, and the
+    time, level and logger of every other, were never in `docker compose logs`.
+    """
+
+    def test_a_line_names_its_time_level_and_logger(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.agent_session").info("Agent turn refused: no agent")
+
+        assert re.fullmatch(
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ INFO app\.services\.agent_session: "
+            r"Agent turn refused: no agent\n",
+            stderr.getvalue(),
+        )
+
+    def test_the_level_is_the_threshold_of_the_applications_own_loggers(self):
+        with bare_root() as stderr:
+            configure_log_output("WARNING")
+            agent = logging.getLogger("app.services.agent")
+            agent.info("connected")
+            agent.warning("could not reach the provider")
+
+        assert "connected" not in stderr.getvalue()
+        assert "could not reach the provider" in stderr.getvalue()
+
+    def test_a_library_stays_at_warning_whatever_the_level_is(self):
+        """httpx writes `HTTP Request: GET <url>` at `INFO`, query string included, and
+        a library's line is not one this module can promise to scrub."""
+        with bare_root() as stderr:
+            configure_log_output("DEBUG")
+            library = logging.getLogger("httpx")
+            library.info('HTTP Request: GET https://x.example/models?key=abc "200 OK"')
+            library.warning("a library warning")
+
+        assert "HTTP Request" not in stderr.getvalue()
+        assert "a library warning" in stderr.getvalue()
+
+    def test_what_a_call_passed_as_extra_follows_the_message(self):
+        """The code base logs an event name and puts the detail in `extra`, which the
+        stock formatter never printed - `voice_call_failed`, and not which call."""
+        call_id = uuid4()
+
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.voice.session").info(
+                "voice_call_failed", extra={"call_id": call_id, "attempt": 3}
+            )
+
+        assert stderr.getvalue().endswith(f" voice_call_failed call_id={call_id} attempt=3\n")
+
+    @pytest.mark.security
+    def test_a_value_in_extra_cannot_start_an_entry_of_its_own(self):
+        """A string is escaped by the filter; an object is escaped as it is rendered,
+        because its `str()` is not something the filter ever saw."""
+
+        class Chatty:
+            def __str__(self) -> str:
+                return "x\n2026-01-01T00:00:00Z CRITICAL app.audit: admin promoted somebody"
+
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.x").warning(
+                "event", extra={"who": Chatty(), "caller": "id:nobody\r\n2026-01-01 FORGED"}
+            )
+
+        assert stderr.getvalue().count("\n") == 1, "one entry, on one line"
+        assert "who=x\\n2026-01-01T00:00:00Z CRITICAL app.audit" in stderr.getvalue()
+        assert "caller=id:nobody\\r\\n2026-01-01 FORGED" in stderr.getvalue()
+
+    @pytest.mark.security
+    def test_the_handler_redacts_a_message_and_the_traceback_that_follows_it(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            failing = logging.getLogger("app.services.rag.ingestion")
+            failing.error(REDACTABLE_LINE)
+            try:
+                _fail_with(
+                    RuntimeError(f"POST https://api.example.com refused; key {_SAMPLE_VALUE}")
+                )
+            except RuntimeError:
+                failing.exception("Ingestion failed")
+
+        emitted = stderr.getvalue()
+        assert "[API_KEY_REDACTED]" in emitted
+        assert "[EMAIL_REDACTED]" in emitted
+        assert _SAMPLE_VALUE not in emitted
+        assert "a@b.com" not in emitted
+        assert "Traceback (most recent call last)" in emitted
+
+    def test_a_failure_is_two_lines_the_entry_and_its_traceback(self):
+        """A traceback's own newlines are written out, so the whole of it is one line."""
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            try:
+                _fail_with(ConnectionError("[SSL: CERTIFICATE_VERIFY_FAILED]"))
+            except ConnectionError:
+                logging.getLogger("app.services.model_catalog").warning(
+                    "Could not list models", exc_info=True
+                )
+
+        entry, traceback = stderr.getvalue().splitlines()
+        assert entry.endswith("WARNING app.services.model_catalog: Could not list models")
+        assert traceback.startswith("Traceback (most recent call last)")
+        assert "CERTIFICATE_VERIFY_FAILED" in traceback
+
+    def test_the_time_is_utc_whatever_zone_the_container_is_in(self, monkeypatch):
+        record = logging.LogRecord("app.x", logging.INFO, "p", 1, "m", None, None)
+        record.created = 86_400.0
+        monkeypatch.setenv("TZ", "Asia/Kolkata")
+        time.tzset()
+
+        try:
+            with bare_root():
+                configure_log_output("INFO")
+                (handler,) = logging.getLogger().handlers
+                formatted = handler.format(record)
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+        assert formatted == "1970-01-02T00:00:00Z INFO app.x: m"
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_refusal_s_details_are_redacted_in_the_line(self):
+        """The reproduction from review: a duplicate sign-up is refused with the address
+        in `details`, and the handler logs `details` as an extra."""
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            await app_exception_handler(
+                _HttpConnection(),
+                AlreadyExistsError(
+                    message="Email already registered", details={"email": "alice@example.com"}
+                ),
+            )
+
+        assert "alice@example.com" not in stderr.getvalue()
+        assert "details={'email': '[EMAIL_REDACTED]'}" in stderr.getvalue()
+
+    @pytest.mark.security
+    def test_a_credential_named_extra_is_masked_in_the_line(self):
+        with bare_root() as stderr:
+            configure_log_output("INFO")
+            logging.getLogger("app.services.example").warning(
+                "provider_refused", extra={"provider": "otari", "api_key": "sk-short"}
+            )
+
+        assert "sk-short" not in stderr.getvalue()
+        assert stderr.getvalue().endswith(" provider_refused provider=otari api_key=[REDACTED]\n")
+
+    def test_the_handler_is_installed_once(self):
+        """The API's lifespan, the worker and each ingest child all call it."""
+        with bare_root():
+            configure_log_output("INFO")
+            configure_log_output("DEBUG")
+            (handler,) = logging.getLogger().handlers
+            level = logging.getLogger("app").level
+
+        assert sum(isinstance(f, PiiRedactionFilter) for f in handler.filters) == 1
+        assert level == logging.DEBUG, "the second call sets the level again"
+
+    def test_a_process_with_a_handler_of_its_own_is_left_alone(self):
+        """An operator's `--log-config`, or a test runner's capture: as `basicConfig`
+        does, a root handler somebody else installed means logging is theirs."""
+        own = logging.StreamHandler(io.StringIO())
+
+        with bare_root():
+            logging.getLogger().addHandler(own)
+            configure_log_output("DEBUG")
+            handlers = list(logging.getLogger().handlers)
+            level = logging.getLogger("app").level
+
+        assert handlers == [own]
+        assert level == logging.NOTSET
+
+
+@pytest.mark.anyio
+async def test_the_lifespan_prints_the_applications_log_at_the_configured_level(monkeypatch):
+    """The API is the process whose log `docker compose logs app` shows."""
+    from app import main
+    from tests.test_lifespan_drain import _stub_startup
+
+    _stub_startup(monkeypatch)
+    monkeypatch.setattr(main.settings, "LOG_LEVEL", "DEBUG")
+
+    async with main.lifespan(FastAPI()):
+        pass
+
+    main.configure_log_output.assert_called_once_with("DEBUG")

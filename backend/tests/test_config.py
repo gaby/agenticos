@@ -28,6 +28,38 @@ class TestDefaultOrgBudget:
             Settings(DEFAULT_ORG_MONTHLY_BUDGET_USD=bad)
 
 
+class TestLogLevel:
+    def test_info_is_the_default(self, monkeypatch):
+        """Without the environment: a developer's `LOG_LEVEL` is not the default."""
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+
+        assert Settings(_env_file=None).LOG_LEVEL == "INFO"
+
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            ("debug", "DEBUG"),
+            ("Warning", "WARNING"),
+            (" error ", "ERROR"),
+            ("CRITICAL", "CRITICAL"),
+            ("warn", "WARNING"),
+            ("FATAL", "CRITICAL"),
+        ],
+    )
+    def test_a_level_is_accepted_in_any_case_and_under_the_aliases_logging_accepts(
+        self, written, expected
+    ):
+        """`LOG_LEVEL=info` is how most people write it and `WARN` how most other stacks
+        do; refusing either stops the API from starting over a spelling `logging`
+        itself understands."""
+        assert expected == Settings(LOG_LEVEL=written).LOG_LEVEL
+
+    @pytest.mark.parametrize("bad", ["verbose", "", "10", 20])
+    def test_anything_that_is_not_a_level_is_refused(self, bad):
+        with pytest.raises(ValidationError):
+            Settings(LOG_LEVEL=bad)
+
+
 class TestDetachedChatTurn:
     def test_two_hours_is_the_longest_a_left_turn_may_run(self):
         """Past `RUNNING_HORIZON` the conversation list stops calling the run at

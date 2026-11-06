@@ -916,7 +916,7 @@ async def _connector_credential(
             key_version=row.key_version,
         )
     except Exception:
-        logger.warning("sync_source_secret_unusable", extra={"secret": str(row.id)})
+        logger.warning("sync_source_secret_unusable", extra={"secret_id": str(row.id)})
         return None
 
 

@@ -106,6 +106,19 @@ class Settings(BaseSettings):
     DB_ECHO: bool = (
         False  # Set DB_ECHO=true to log SQL queries (latency + log-noise drain by default)
     )
+    # How much of this application's own logging is printed; libraries stay at
+    # WARNING (`app.core.logging.configure_log_output`).
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+
+    @field_validator("LOG_LEVEL", mode="before")
+    @classmethod
+    def log_level_name(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        level = value.strip().upper()
+        # The two other names `logging.getLevelName` understands.
+        return {"WARN": "WARNING", "FATAL": "CRITICAL"}.get(level, level)
+
     ENVIRONMENT: Literal["development", "local", "staging", "production"] = "local"
     TIMEZONE: str = "UTC"  # IANA timezone (e.g. "UTC", "Europe/Warsaw", "America/New_York")
     MODELS_CACHE_DIR: Path = Path("./models_cache")

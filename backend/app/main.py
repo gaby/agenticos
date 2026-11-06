@@ -40,7 +40,7 @@ from app.core.logfire_setup import instrument_asyncpg
 from app.core.logfire_setup import instrument_redis
 from app.core.logfire_setup import instrument_httpx
 from app.core.logfire_setup import instrument_pydantic_ai
-from app.core.logging import setup_logging
+from app.core.logging import configure_log_output, setup_logging
 from app.core.body_limit import BodySizeLimitMiddleware
 from app.core import background
 from app.core import maintenance
@@ -246,6 +246,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[LifespanState]:
     # correct but pays a connect per request (#1079).
     claim_pooled_engines()
     watchdog = EventLoopWatchdog(wedged_after=settings.EVENT_LOOP_WEDGED_AFTER)
+    # Here and not in `create_app`: the CLI and the worker import this module too, and
+    # importing it must not install a handler.
+    configure_log_output(settings.LOG_LEVEL)
     # Again, now that the server has configured its own loggers: uvicorn's access
     # log has a handler of its own, and in some launch modes it is created after
     # `create_app` ran the first call.

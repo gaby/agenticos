@@ -31,7 +31,9 @@ from app.worker.attempt import Attempt, running
 from app.worker.errors import describe
 from app.worker.registry import Handlers
 
-logger = logging.getLogger(__name__)
+# Not `__name__`: the parent spawns this with `python -m app.worker.child`, which makes
+# that "__main__" - a logger outside the `app` tree `LOG_LEVEL` governs.
+logger = logging.getLogger("app.worker.child")
 
 READY = '{"ready": true}'
 
@@ -112,8 +114,11 @@ def main(
     replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
-    from app.core.logging import setup_logging
+    from app.core.config import settings
+    from app.core.logging import configure_log_output, setup_logging
 
+    # stderr, which the parent leaves alone: stdout is the reply channel (above).
+    configure_log_output(settings.LOG_LEVEL)
     setup_logging()
     handlers = load_handlers(argv[1] if len(argv) > 1 else "app.worker.handlers:ingest")
     asyncio.run(serve(handlers, sys.stdin, replies))
